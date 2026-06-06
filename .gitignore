@@ -1,0 +1,13 @@
+﻿data/
+models/
+venv/
+__pycache__/
+utils/__pycache__/
+*.pkl
+*.pyc
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.tiff
+*.tif
