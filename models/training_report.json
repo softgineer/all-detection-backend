@@ -1,0 +1,18 @@
+{
+  "accuracy": 87.23,
+  "precision": 99.4,
+  "recall": 84.34,
+  "f1_score": 91.26,
+  "roc_auc": 97.98,
+  "n_train": 4532,
+  "n_test": 1002,
+  "pca_components": 50,
+  "feature_dim": 2091,
+  "use_deep": true,
+  "training_time_s": 5657.7,
+  "classifier_accuracy": {
+    "SVM": 79.64,
+    "RF": 89.42,
+    "GB": 87.62
+  }
+}
