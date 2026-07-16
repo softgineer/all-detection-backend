@@ -14,7 +14,7 @@ import os, sys, json, time, asyncio
 from contextlib import asynccontextmanager
 from pathlib    import Path
 
-from fastapi              import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
+from fastapi              import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses    import JSONResponse
 from pydantic             import BaseModel
@@ -35,7 +35,7 @@ if not HISTORY_FILE.exists():
     HISTORY_FILE.write_text("[]")
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 def load_history() -> list:
     """Read history.json safely; return [] if missing/corrupted."""
@@ -64,6 +64,62 @@ def build_history_record(filename: str, result: dict, inference_ms: float) -> di
         "inference_ms": inference_ms,
         "votes":        result.get("votes"),
     }
+
+# ── Auth storage (single shared admin password, JWT session tokens) ────────
+import bcrypt
+import jwt as pyjwt
+
+AUTH_FILE  = DATA_DIR / "auth.json"
+JWT_SECRET = os.environ.get("JWT_SECRET", "dev-only-change-me-in-production")
+JWT_ALGO   = "HS256"
+JWT_EXPIRY_HOURS = 24 * 7   # 7 days
+
+DEFAULT_ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "changeme123")
+
+if not AUTH_FILE.exists():
+    default_hash = bcrypt.hashpw(DEFAULT_ADMIN_PASSWORD.encode(), bcrypt.gensalt()).decode()
+    with open(AUTH_FILE, "w") as f:
+        json.dump({"password_hash": default_hash}, f, indent=2)
+    print(f"[Auth] No auth.json found — created one with default password "
+          f"'{DEFAULT_ADMIN_PASSWORD}'. Change this via POST /api/auth/change-password "
+          f"or by setting the ADMIN_PASSWORD env var before first run.")
+
+def load_auth() -> dict:
+    with open(AUTH_FILE, "r") as f:
+        return json.load(f)
+
+def save_auth(data: dict) -> None:
+    with open(AUTH_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+def create_token() -> str:
+    payload = {
+        "sub": "admin",
+        "exp": datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRY_HOURS),
+        "iat": datetime.now(timezone.utc),
+    }
+    return pyjwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
+
+def verify_token(token: str) -> bool:
+    try:
+        pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+        return True
+    except pyjwt.PyJWTError:
+        return False
+
+from fastapi import Header
+
+async def require_auth(authorization: str = Header(default=None)):
+    """
+    FastAPI dependency — protects a route behind a valid Bearer JWT.
+    Usage: @app.get(..., dependencies=[Depends(require_auth)])
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or malformed Authorization header.")
+    token = authorization.removeprefix("Bearer ").strip()
+    if not verify_token(token):
+        raise HTTPException(status_code=401, detail="Invalid or expired session. Please log in again.")
+    return True
 
 # ── Singleton predictor ────────────────────────────────────────────────────
 predictor = ALLPredictor(models_dir=MODELS_DIR)
@@ -162,7 +218,7 @@ async def health():
     }
 
 
-@app.post("/api/predict", tags=["Prediction"])
+@app.post("/api/predict", tags=["Prediction"], dependencies=[Depends(require_auth)])
 async def predict(file: UploadFile = File(...)):
     """
     Upload a blood smear image (PNG / JPG / BMP / TIFF).
@@ -275,7 +331,7 @@ async def training_status():
 # PREDICTION HISTORY — persisted to data/history.json
 # ══════════════════════════════════════════════════════════════════════════
 
-@app.get("/api/history", tags=["History"])
+@app.get("/api/history", tags=["History"], dependencies=[Depends(require_auth)])
 async def get_history(limit: int = 100):
     """
     Return past predictions, most recent first.
@@ -292,12 +348,53 @@ async def get_history(limit: int = 100):
     }
 
 
-@app.delete("/api/history", tags=["History"])
+@app.delete("/api/history", tags=["History"], dependencies=[Depends(require_auth)])
 async def clear_history():
     """Clear all stored prediction history."""
     with open(HISTORY_FILE, "w") as f:
         json.dump([], f)
     return {"success": True, "message": "History cleared."}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# AUTH — single shared admin password, JWT session tokens
+# ══════════════════════════════════════════════════════════════════════════
+
+class LoginRequest(BaseModel):
+    password: str
+
+class ChangePasswordRequest(BaseModel):
+    old_password: str
+    new_password: str
+
+
+@app.post("/api/auth/login", tags=["Auth"])
+async def login(req: LoginRequest):
+    """Check the shared admin password and issue a JWT session token."""
+    auth = load_auth()
+    if not bcrypt.checkpw(req.password.encode(), auth["password_hash"].encode()):
+        raise HTTPException(status_code=401, detail="Incorrect password.")
+    token = create_token()
+    return {"success": True, "token": token, "expires_in_hours": JWT_EXPIRY_HOURS}
+
+
+@app.post("/api/auth/change-password", tags=["Auth"], dependencies=[Depends(require_auth)])
+async def change_password(req: ChangePasswordRequest):
+    """Change the shared admin password. Requires a valid session token."""
+    auth = load_auth()
+    if not bcrypt.checkpw(req.old_password.encode(), auth["password_hash"].encode()):
+        raise HTTPException(status_code=401, detail="Current password is incorrect.")
+    if len(req.new_password) < 6:
+        raise HTTPException(status_code=400, detail="New password must be at least 6 characters.")
+    new_hash = bcrypt.hashpw(req.new_password.encode(), bcrypt.gensalt()).decode()
+    save_auth({"password_hash": new_hash})
+    return {"success": True, "message": "Password updated. Please log in again with the new password."}
+
+
+@app.get("/api/auth/check", tags=["Auth"], dependencies=[Depends(require_auth)])
+async def check_auth():
+    """Lightweight endpoint the frontend can call to verify a stored token is still valid."""
+    return {"valid": True}
 
 
 # ── Run directly ───────────────────────────────────────────────────────────
@@ -312,7 +409,7 @@ if __name__ == "__main__":
 from typing import List
 import asyncio
 
-@app.post("/api/predict/batch", tags=["Prediction"])
+@app.post("/api/predict/batch", tags=["Prediction"], dependencies=[Depends(require_auth)])
 async def predict_batch(files: List[UploadFile] = File(...)):
     """
     Upload multiple blood smear images at once (up to 20).
