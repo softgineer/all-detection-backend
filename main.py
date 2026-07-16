@@ -27,6 +27,44 @@ from utils.predictor import ALLPredictor
 BASE_DIR   = Path(__file__).parent
 MODELS_DIR = str(BASE_DIR / "models")
 
+# ── History storage (persistent JSON file) ─────────────────────────────────
+DATA_DIR     = BASE_DIR / "data"
+HISTORY_FILE = DATA_DIR / "history.json"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+if not HISTORY_FILE.exists():
+    HISTORY_FILE.write_text("[]")
+
+import uuid
+from datetime import datetime, timezone
+
+def load_history() -> list:
+    """Read history.json safely; return [] if missing/corrupted."""
+    try:
+        with open(HISTORY_FILE, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, FileNotFoundError):
+        return []
+
+def save_history_record(record: dict) -> None:
+    """Append one prediction record to history.json on disk."""
+    history = load_history()
+    history.append(record)
+    with open(HISTORY_FILE, "w") as f:
+        json.dump(history, f, indent=2)
+
+def build_history_record(filename: str, result: dict, inference_ms: float) -> dict:
+    """Build a compact history entry from a prediction result."""
+    return {
+        "id":           str(uuid.uuid4()),
+        "timestamp":    datetime.now(timezone.utc).isoformat(),
+        "filename":     filename,
+        "label":        result.get("label"),
+        "label_id":     result.get("label_id"),
+        "confidence":   result.get("confidence"),
+        "inference_ms": inference_ms,
+        "votes":        result.get("votes"),
+    }
+
 # ── Singleton predictor ────────────────────────────────────────────────────
 predictor = ALLPredictor(models_dir=MODELS_DIR)
 
@@ -164,6 +202,13 @@ async def predict(file: UploadFile = File(...)):
         raise HTTPException(status_code=500,
                             detail=f"Prediction failed: {str(e)}")
 
+    # ── Persist to history ─────────────────────────────────────────────
+    try:
+        record = build_history_record(file.filename, result, elapsed_ms)
+        save_history_record(record)
+    except Exception as e:
+        print(f"[History] Failed to save record: {e}")
+
     return JSONResponse({
         "success":      True,
         "filename":     file.filename,
@@ -226,6 +271,35 @@ async def training_status():
     return training_state
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# PREDICTION HISTORY — persisted to data/history.json
+# ══════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/history", tags=["History"])
+async def get_history(limit: int = 100):
+    """
+    Return past predictions, most recent first.
+    - limit : max number of records to return (default 100)
+    """
+    history = load_history()
+    history_sorted = list(reversed(history))[:limit]
+    all_count  = sum(1 for r in history if r.get("label_id") == 1)
+    norm_count = sum(1 for r in history if r.get("label_id") == 0)
+    return {
+        "total":   len(history),
+        "summary": {"ALL_positive": all_count, "Normal": norm_count},
+        "records": history_sorted,
+    }
+
+
+@app.delete("/api/history", tags=["History"])
+async def clear_history():
+    """Clear all stored prediction history."""
+    with open(HISTORY_FILE, "w") as f:
+        json.dump([], f)
+    return {"success": True, "message": "History cleared."}
+
+
 # ── Run directly ───────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
@@ -261,6 +335,10 @@ async def predict_batch(files: List[UploadFile] = File(...)):
             t0     = time.perf_counter()
             result = predictor.predict_bytes(contents)
             ms     = round((time.perf_counter() - t0) * 1000, 1)
+            try:
+                save_history_record(build_history_record(upload.filename, result, ms))
+            except Exception as e:
+                print(f"[History] Failed to save batch record: {e}")
             return {"filename": upload.filename, "inference_ms": ms,
                     "success": True, **result}
         except Exception as e:
