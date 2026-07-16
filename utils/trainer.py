@@ -113,7 +113,7 @@ def _train_and_save(X_train, y_train, X_test, y_test,
     pca_probe = PCA(n_components=0.95, random_state=42)
     pca_probe.fit(X_tr_n)
     n_auto = pca_probe.n_components_
-    n_final = max(n_auto, min(50, X_tr_n.shape[1]))   # at least 50, at most full dim
+    n_final = max(n_auto, min(100, X_tr_n.shape[1]))   # at least 50, at most full dim
 
     pca     = PCA(n_components=n_final, random_state=42)
     Z_train = pca.fit_transform(X_tr_n)
@@ -125,18 +125,18 @@ def _train_and_save(X_train, y_train, X_test, y_test,
 
     # 4. Train classifiers
     if verbose: print("[Trainer] Training SVM (RBF, C=10, class_weight=balanced) …")
-    svm = SVC(kernel="rbf", C=10, gamma="auto",
+    svm = SVC(kernel="rbf", C=100, gamma="scale",
               class_weight="balanced", probability=True, random_state=42)
     svm.fit(Z_train, y_train_sm)
 
     if verbose: print("[Trainer] Training Random Forest (n=200, class_weight=balanced) …")
-    rf = RandomForestClassifier(n_estimators=200, class_weight="balanced",
+    rf = RandomForestClassifier(n_estimators=500, class_weight="balanced",
                                 random_state=42, n_jobs=-1)
     rf.fit(Z_train, y_train_sm)
 
     if verbose: print("[Trainer] Training Gradient Boosting (n=150) …")
-    gb = GradientBoostingClassifier(n_estimators=150, learning_rate=0.05,
-                                    max_depth=4, random_state=42)
+    gb = GradientBoostingClassifier(n_estimators=300, learning_rate=0.01,
+                                    max_depth=5, random_state=42)
     gb.fit(Z_train, y_train_sm)
 
     # 5. Ensemble evaluation (soft majority vote)
